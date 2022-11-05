@@ -40,7 +40,7 @@ esm_model_name = "esm2_t30_150M_UR50D"
 esm_model_layer_count = 30
 esm_embedding_dim = 640
 batch_size = 16
-epochs = 15
+epochs = 75
 
 # max padded length of sequence
 max_padded_length = 1000 # 933 actual maximum length on training/test data
@@ -170,7 +170,7 @@ def run(model, run_loader, epoch, training=False) :
 
         tq.refresh()
 
-    return auc, total_loss, total_loss/batch_cnt
+    return auc, total_loss, total_loss/batch_cnt, preds, reals
 
 # 5-fold cross validation
 print("Commencing 5-fold cross-validation.")
@@ -178,9 +178,8 @@ kf = KFold(n_splits=5,
            random_state=13,
            shuffle=True)
 
-# initialize best model
-best_model = None
-best_auc = 0.0
+all_predictions = []
+all_reals = []
 split_count = 0
 
 for train_indices, dev_indices in kf.split(X_train) :
@@ -199,6 +198,10 @@ for train_indices, dev_indices in kf.split(X_train) :
 
     dev_dataset = EpitopeDataset(X_dev, mask_dev, y_dev)
     dev_dataloader = DataLoader(dev_dataset, batch_size=batch_size, shuffle=True)
+
+    # initialize best model
+    best_model = None
+    best_auc = 0.0
 
     # initialize model, scheduler, optimizer
     model = nn.DataParallel(EpitopeModel(
@@ -219,7 +222,7 @@ for train_indices, dev_indices in kf.split(X_train) :
     )
 
     # training loop
-    print(f"Training model for split {split_count}.")
+    print(f"> Training model for split {split_count}.")
     split_count += 1
 
     for epoch in range(1, epochs+1) :
@@ -230,7 +233,7 @@ for train_indices, dev_indices in kf.split(X_train) :
         # eval
         model.eval()
         with torch.no_grad() :
-            auc, _, val_loss = run(model, dev_dataloader, epoch, False)
+            auc, _, val_loss, _, _ = run(model, dev_dataloader, epoch, False)
 
         # update best_model
         if auc > best_auc :
@@ -240,10 +243,14 @@ for train_indices, dev_indices in kf.split(X_train) :
         # update lr based on dev loss
         scheduler.step(val_loss)
 
-# test
-print("Running best model on test dataset.")
-best_model.eval()
-with torch.no_grad() :
-    auc, _, test_loss = run(best_model, test_dataloader, -1, False)
+    # test
+    print("> > Running best model on test dataset.")
+    best_model.eval()
+    with torch.no_grad() :
+        auc, _, test_loss, preds, reals = run(best_model, test_dataloader, epoch, False)
+        all_predictions.extend(preds)
+        all_reals.extend(reals)
+
+print(f"AUC={roc_auc_score(all_reals, all_predictions)}")
 
 
