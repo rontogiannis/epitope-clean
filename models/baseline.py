@@ -21,6 +21,7 @@ from sklearn.metrics import roc_auc_score
 from collections import defaultdict
 from sklearn.model_selection import KFold
 
+# make everything reproducable
 torch.manual_seed(13)
 
 # set the device
@@ -36,9 +37,13 @@ train_pdbs = "/data/scratch/aronto/epitope_clean/data/BP3C50ID/train/"
 test_path = "/data/scratch/aronto/epitope_clean/data/BP3C50ID/test.fasta"
 test_pdbs = "/data/scratch/aronto/epitope_clean/data/BP3C50ID/test/"
 
-esm_model_name = "esm2_t30_150M_UR50D"
-esm_model_layer_count = 30
-esm_embedding_dim = 640
+ESM_MODELS = [
+    ("esm2_t30_150M_UR50D", 30, 640),
+    ("esm1b_t33_650M_UR50S", 33, 1280),
+]
+
+esm_model_name, esm_model_layer_count, esm_embedding_dim = ESM_MODELS[1]
+
 batch_size = 16
 epochs = 75
 
@@ -60,7 +65,6 @@ class EpitopeDataset(Dataset) :
         self.X = torch.tensor(X, dtype=torch.long).to(device) # N x (max_padded_length+2)
         self.mask = torch.tensor(mask, dtype=torch.long).to(device) # N x (max_padded_length+2)
         self.y = torch.tensor(y, dtype=torch.long).to(device) # N x (max_padded_length+2)
-        # self.show_shapes()
 
     def __len__(self) :
         return len(self.X)
@@ -138,7 +142,7 @@ def run(model, run_loader, epoch, training=False) :
 
     preds = []
     reals = []
-    auc = 0.5
+    auc = 0.0
 
     for batch in tq :
         X, mask, y = batch
