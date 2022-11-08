@@ -70,7 +70,7 @@ ESM_MODELS = [
 esm_model_name, esm_model_layer_count, esm_embedding_dim = ESM_MODELS[0]
 
 batch_size = 8
-epochs = 75
+epochs = 10
 
 kappa = 10
 lambdas = [1., 2., 5., 10., 30.]
@@ -222,19 +222,25 @@ class EpitopeModel(nn.Module) :
         self,
         embedding_dim: int,
         rho_dimension: int = 5,
-        rho_embedding_dim: int = 128,
+        hidden_dim: int = 256,
+        dropout: int = 0.2,
         finetune_lm: bool = False,
+        use_rho: bool = False,
     ) :
         super().__init__()
 
         self.embedding_dim = embedding_dim
         self.rho_dimension = rho_dimension
-        self.rho_embedding_dim = rho_embedding_dim
         self.finetune_lm = finetune_lm
+        self.use_rho = use_rho
 
         self.esm_embedder = esm_model # TODO: i dont like using global variables, pls change that
-        self.linear = nn.Linear(embedding_dim+rho_embedding_dim, 1)
-        self.rho_linear = nn.Linear(rho_dimension, rho_embedding_dim)
+        self.linear = nn.Sequential(
+            nn.Linear(embedding_dim+rho_dimension if use_rho else embedding_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden_dim, 1),
+        )
 
         for param in self.esm_embedder.parameters() :
             param.requires_grad = finetune_lm
@@ -247,9 +253,9 @@ class EpitopeModel(nn.Module) :
             embeddings = self.esm_embedder(X, repr_layers=[esm_model_layer_count], return_contacts=True)
 
         embeddings = embeddings["representations"][esm_model_layer_count].to(device)
-        rho_embeddings = self.rho_linear(rho)
-        concat_embeddings = torch.cat((embeddings, rho_embeddings), 2)
-        output = self.linear(concat_embeddings)
+        if self.use_rho :
+            embeddings = torch.cat((embeddings, rho), 2)
+        output = self.linear(embeddings)
 
         return output
 
@@ -280,7 +286,7 @@ def run(model, run_loader, epoch, training=False) :
         if training :
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 0.5)
             optimizer.step()
 
         total_loss += loss.item()
@@ -334,6 +340,11 @@ for train_indices, dev_indices in kf.split(X_train) :
     # initialize model, scheduler, optimizer
     model = nn.DataParallel(EpitopeModel(
         embedding_dim=esm_embedding_dim,
+        rho_dimension=5,
+        hidden_dim=256,
+        dropout=0.1,
+        finetune_lm=False,
+        use_rho=True
     )).to(device)
 
     criterion = nn.BCEWithLogitsLoss()
