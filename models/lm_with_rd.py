@@ -66,12 +66,13 @@ test_pdbs = "/data/scratch/aronto/epitope_clean/data/BP3C50ID/test-pred/"
 ESM_MODELS = [
     ("esm2_t30_150M_UR50D", 30, 640),
     ("esm1b_t33_650M_UR50S", 33, 1280),
+    ("esm2_t33_650M_UR50D", 33, 1280),
 ]
 
-esm_model_name, esm_model_layer_count, esm_embedding_dim = ESM_MODELS[0]
+esm_model_name, esm_model_layer_count, esm_embedding_dim = ESM_MODELS[2]
 
 batch_size = 16
-epochs = 200
+epochs = 20
 
 kappa = 16
 lambdas = [1., 2., 5., 10., 30.]
@@ -108,11 +109,11 @@ class EpitopeDataset(Dataset) :
 
     def show_shapes(self) :
         print("Shape check:")
-        print(f"> {self.X.shape=}")
-        print(f"> {self.mask.shape=}")
-        print(f"> {self.y.shape=}")
-        print(f"> {self.coord.shape=}")
-        print(f"> {self.rhos.shape=}")
+        print(f" {self.X.shape=}")
+        print(f" {self.mask.shape=}")
+        print(f" {self.y.shape=}")
+        print(f" {self.coord.shape=}")
+        print(f" {self.rhos.shape=}")
 
 # utility functions for calculating the approximation of residue depth
 def sq_norm(xi, xj) :
@@ -244,9 +245,12 @@ class EpitopeModel(nn.Module) :
             num_tokens=32,
             num_positions=max_padded_length+2,
             dim=egnn_dim,
+            m_dim=4*egnn_dim, # TODO: parametrize
             depth=egnn_depth,
             num_nearest_neighbors=egnn_max_nn,
-            coor_weights_clamp_value=2.
+            coor_weights_clamp_value=2.,
+            norm_coors=True, # TODO: parametrize
+            dropout=dropout,
         )
 
         self.linear = nn.Sequential(
@@ -359,27 +363,18 @@ for train_indices, dev_indices in kf.split(X_train) :
     model = nn.DataParallel(EpitopeModel(
         embedding_dim=esm_embedding_dim,
         rho_dimension=ls,
-        hidden_dim=256,
-        egnn_dim=64,
+        hidden_dim=512,
+        egnn_dim=128,
         egnn_depth=2,
-        egnn_max_nn=10,
-        dropout=0,
+        egnn_max_nn=8,
+        dropout=0.25,
         finetune_lm=False,
         use_rho=True,
         use_egnn=True,
     )).to(device)
 
     criterion = nn.BCEWithLogitsLoss()
-
-    optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=0.01) # not setting it lower cause the scheduler will reduce it on validation score plateau
-
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        factor=0.75,
-        patience=2,
-        min_lr=0,
-        verbose=True
-    )
+    optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=0.001)
 
     # training loop
     print(f"> Training model for split {split_count}.")
@@ -400,11 +395,8 @@ for train_indices, dev_indices in kf.split(X_train) :
             best_auc = auc
             best_model = copy.deepcopy(model)
 
-        # update lr based on dev loss
-        scheduler.step(val_loss)
-
     # test
-    print("> > Running best model on test dataset.")
+    print("> Running best model on test dataset.")
     best_model.eval()
     with torch.no_grad() :
         auc, _, test_loss, preds, reals = run(best_model, test_dataloader, epoch, False)
