@@ -22,6 +22,7 @@ from collections import defaultdict
 from sklearn.model_selection import KFold
 from Bio.PDB.PDBParser import PDBParser
 from sklearn.neighbors import NearestNeighbors
+from egnn_pytorch import EGNN_Network
 
 d3to1 = {
     "CYS": "C",
@@ -69,15 +70,15 @@ ESM_MODELS = [
 
 esm_model_name, esm_model_layer_count, esm_embedding_dim = ESM_MODELS[0]
 
-batch_size = 8
-epochs = 10
+batch_size = 16
+epochs = 200
 
-kappa = 10
+kappa = 16
 lambdas = [1., 2., 5., 10., 30.]
 ls = len(lambdas)
 
 # max padded length of sequence
-max_padded_length = 1000 # 933 actual maximum length on training/test data
+max_padded_length = 950 # 933 actual maximum length on training/test data
 
 # load esm2
 try :
@@ -92,7 +93,7 @@ batch_converter = alphabet.get_batch_converter()
 class EpitopeDataset(Dataset) :
     def __init__(self, X, mask, y, coord, rhos) :
         self.X = torch.tensor(X, dtype=torch.long).to(device) # N x (max_padded_length+2)
-        self.mask = torch.tensor(mask, dtype=torch.long).to(device) # N x (max_padded_length+2)
+        self.mask = torch.tensor(mask, dtype=torch.long).bool().to(device) # N x (max_padded_length+2)
         self.y = torch.tensor(y, dtype=torch.long).to(device) # N x (max_padded_length+2)
         self.coord = torch.tensor(coord, dtype=torch.float).to(device) # N x (max_padded_length+2) x 3
         self.rhos = torch.tensor(rhos, dtype=torch.float).to(device) # N x (max_padded_length+2) x |Lambdas|
@@ -223,29 +224,45 @@ class EpitopeModel(nn.Module) :
         embedding_dim: int,
         rho_dimension: int = 5,
         hidden_dim: int = 256,
+        egnn_dim: int = 128,
+        egnn_depth: int = 3,
+        egnn_max_nn: int = 16,
         dropout: int = 0.2,
         finetune_lm: bool = False,
         use_rho: bool = False,
+        use_egnn: bool = False,
     ) :
         super().__init__()
 
-        self.embedding_dim = embedding_dim
-        self.rho_dimension = rho_dimension
         self.finetune_lm = finetune_lm
         self.use_rho = use_rho
+        self.use_egnn = use_egnn
 
         self.esm_embedder = esm_model # TODO: i dont like using global variables, pls change that
+
+        self.egnn = EGNN_Network(
+            num_tokens=32,
+            num_positions=max_padded_length+2,
+            dim=egnn_dim,
+            depth=egnn_depth,
+            num_nearest_neighbors=egnn_max_nn,
+            coor_weights_clamp_value=2.
+        )
+
         self.linear = nn.Sequential(
-            nn.Linear(embedding_dim+rho_dimension if use_rho else embedding_dim, hidden_dim),
+            nn.Linear(embedding_dim+(rho_dimension if use_rho else 0)+(egnn_dim+3 if use_egnn else 0), hidden_dim),
             nn.ReLU(),
             nn.Dropout(p=dropout),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_dim, hidden_dim//2),
+            nn.ReLU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden_dim//2, 1),
         )
 
         for param in self.esm_embedder.parameters() :
             param.requires_grad = finetune_lm
 
-    def forward(self, X: Tensor, rho: Tensor) -> Tensor :
+    def forward(self, X: Tensor, coords: Tensor, mask: Tensor, rho: Tensor) -> Tensor :
         if self.finetune_lm == False :
             with torch.no_grad() :
                 embeddings = self.esm_embedder(X, repr_layers=[esm_model_layer_count], return_contacts=True)
@@ -253,8 +270,9 @@ class EpitopeModel(nn.Module) :
             embeddings = self.esm_embedder(X, repr_layers=[esm_model_layer_count], return_contacts=True)
 
         embeddings = embeddings["representations"][esm_model_layer_count].to(device)
-        if self.use_rho :
-            embeddings = torch.cat((embeddings, rho), 2)
+        egnn_embeddings, egnn_coords = self.egnn(X, coords, mask=mask)
+        if self.use_rho : embeddings = torch.cat((embeddings, rho), 2)
+        if self.use_egnn : embeddings = torch.cat((embeddings, egnn_embeddings, egnn_coords), 2)
         output = self.linear(embeddings)
 
         return output
@@ -272,9 +290,9 @@ def run(model, run_loader, epoch, training=False) :
 
     for batch in tq :
         X, mask, y, coord, rhos = batch
-        output = model(X, rhos)
+        output = model(X, coord, mask, rhos)
 
-        mask = mask.flatten().bool()
+        mask = mask.flatten()
         y = torch.masked_select(y.flatten(), mask)
         output = torch.masked_select(output.flatten(), mask)
 
@@ -294,9 +312,9 @@ def run(model, run_loader, epoch, training=False) :
 
         if batch_cnt == batch_total :
             auc = roc_auc_score(reals, preds)
-            tq.set_description('Epoch #{} | batch loss: {:0.3f}, avg loss: {:0.3f} | AUC: {:0.3f}'.format(epoch, loss.item(), total_loss/batch_cnt, auc))
+            tq.set_description('Epoch #{}/{} | batch loss: {:0.3f}, avg loss: {:0.3f} | AUC: {:0.3f}'.format(epoch, epochs, loss.item(), total_loss/batch_cnt, auc))
         else :
-            tq.set_description('Epoch #{} | batch loss: {:0.3f}, avg loss: {:0.3f} | AUC: ?'.format(epoch, loss.item(), total_loss/batch_cnt))
+            tq.set_description('Epoch #{}/{} | batch loss: {:0.3f}, avg loss: {:0.3f} | AUC: ?'.format(epoch, epochs, loss.item(), total_loss/batch_cnt))
 
         tq.refresh()
 
@@ -340,11 +358,15 @@ for train_indices, dev_indices in kf.split(X_train) :
     # initialize model, scheduler, optimizer
     model = nn.DataParallel(EpitopeModel(
         embedding_dim=esm_embedding_dim,
-        rho_dimension=5,
-        hidden_dim=256,
+        rho_dimension=ls,
+        hidden_dim=512,
+        egnn_dim=128,
+        egnn_depth=4,
+        egnn_max_nn=8,
         dropout=0.1,
-        finetune_lm=False,
-        use_rho=True
+        finetune_lm= False,
+        use_rho=True,
+        use_egnn=True,
     )).to(device)
 
     criterion = nn.BCEWithLogitsLoss()
