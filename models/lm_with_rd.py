@@ -251,10 +251,10 @@ class EpitopeModel(nn.Module) :
 
         self.linear = nn.Sequential(
             nn.Linear(embedding_dim+(rho_dimension if use_rho else 0)+(egnn_dim if use_egnn else 0), hidden_dim),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Dropout(p=dropout),
             nn.Linear(hidden_dim, hidden_dim//2),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Dropout(p=dropout),
             nn.Linear(hidden_dim//2, 1),
         )
@@ -359,25 +359,25 @@ for train_indices, dev_indices in kf.split(X_train) :
     model = nn.DataParallel(EpitopeModel(
         embedding_dim=esm_embedding_dim,
         rho_dimension=ls,
-        hidden_dim=512,
-        egnn_dim=128,
-        egnn_depth=4,
-        egnn_max_nn=8,
-        dropout=0.1,
-        finetune_lm= False,
+        hidden_dim=256,
+        egnn_dim=64,
+        egnn_depth=2,
+        egnn_max_nn=10,
+        dropout=0,
+        finetune_lm=False,
         use_rho=True,
         use_egnn=True,
     )).to(device)
 
     criterion = nn.BCEWithLogitsLoss()
 
-    optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=4.0) # not setting it lower cause the scheduler will reduce it on validation score plateau
+    optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=0.01) # not setting it lower cause the scheduler will reduce it on validation score plateau
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         factor=0.75,
         patience=2,
-        min_lr=0.001,
+        min_lr=0,
         verbose=True
     )
 
