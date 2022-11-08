@@ -250,7 +250,7 @@ class EpitopeModel(nn.Module) :
         )
 
         self.linear = nn.Sequential(
-            nn.Linear(embedding_dim+(rho_dimension if use_rho else 0)+(egnn_dim+3 if use_egnn else 0), hidden_dim),
+            nn.Linear(embedding_dim+(rho_dimension if use_rho else 0)+(egnn_dim if use_egnn else 0), hidden_dim),
             nn.ReLU(),
             nn.Dropout(p=dropout),
             nn.Linear(hidden_dim, hidden_dim//2),
@@ -272,7 +272,7 @@ class EpitopeModel(nn.Module) :
         embeddings = embeddings["representations"][esm_model_layer_count].to(device)
         egnn_embeddings, egnn_coords = self.egnn(X, coords, mask=mask)
         if self.use_rho : embeddings = torch.cat((embeddings, rho), 2)
-        if self.use_egnn : embeddings = torch.cat((embeddings, egnn_embeddings, egnn_coords), 2)
+        if self.use_egnn : embeddings = torch.cat((embeddings, egnn_embeddings), 2)
         output = self.linear(embeddings)
 
         return output
@@ -371,13 +371,13 @@ for train_indices, dev_indices in kf.split(X_train) :
 
     criterion = nn.BCEWithLogitsLoss()
 
-    optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=0.01) # not setting it lower cause the scheduler will reduce it on validation score plateau
+    optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=4.0) # not setting it lower cause the scheduler will reduce it on validation score plateau
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         factor=0.75,
         patience=2,
-        min_lr=0,
+        min_lr=0.001,
         verbose=True
     )
 
