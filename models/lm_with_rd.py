@@ -22,7 +22,7 @@ from collections import defaultdict
 from sklearn.model_selection import KFold
 from Bio.PDB.PDBParser import PDBParser
 from sklearn.neighbors import NearestNeighbors
-from egnn_pytorch import EGNN_Network
+from egnn_pytorch import EGNN_Network, EGNN
 
 d3to1 = {
     "CYS": "C",
@@ -69,7 +69,7 @@ ESM_MODELS = [
     ("esm2_t33_650M_UR50D", 33, 1280),
 ]
 
-esm_model_name, esm_model_layer_count, esm_embedding_dim = ESM_MODELS[2]
+esm_model_name, esm_model_layer_count, esm_embedding_dim = ESM_MODELS[0]
 
 batch_size = 16
 epochs = 20
@@ -226,7 +226,7 @@ class EpitopeModel(nn.Module) :
         rho_dimension: int = 5,
         hidden_dim: int = 256,
         egnn_dim: int = 128,
-        egnn_depth: int = 3,
+        egnn_depth: int = 3, # TODO: for now this has no effect
         egnn_max_nn: int = 16,
         dropout: int = 0.2,
         finetune_lm: bool = False,
@@ -238,27 +238,54 @@ class EpitopeModel(nn.Module) :
         self.finetune_lm = finetune_lm
         self.use_rho = use_rho
         self.use_egnn = use_egnn
+        self.embedding_dim = embedding_dim+(rho_dimension if use_rho else 0)
 
         self.esm_embedder = esm_model # TODO: i dont like using global variables, pls change that
 
-        self.egnn = EGNN_Network(
-            num_tokens=32,
-            num_positions=max_padded_length+2,
-            dim=egnn_dim,
-            m_dim=4*egnn_dim, # TODO: parametrize
-            depth=egnn_depth,
-            num_nearest_neighbors=egnn_max_nn,
-            coor_weights_clamp_value=2.,
-            norm_coors=True, # TODO: parametrize
-            dropout=dropout,
+        # TODO: this is ugly, figure out a way to have a list of EGNN's that works with DataParallel
+        self.egnn_1 = EGNN(
+            dim=self.embedding_dim,            # input dimension
+            edge_dim=0,                        # dimension of the edges, if exists, should be > 0
+            m_dim=egnn_dim,                    # hidden model dimension
+            fourier_features=0,                # number of fourier features for encoding of relative distance - defaults to none as in paper
+            num_nearest_neighbors=egnn_max_nn, # cap the number of neighbors doing message passing by relative distance
+            dropout=dropout,                   # dropout
+            norm_feats=False,                  # whether to layernorm the features
+            norm_coors=True,                   # whether to normalize the coordinates, using a strategy from the SE(3) Transformers paper
+            update_feats=True,                 # whether to update features - you can build a layer that only updates one or the other
+            update_coors=False,                # whether ot update coordinates
+            only_sparse_neighbors=False,       # using this would only allow message passing along adjacent neighbors, using the adjacency matrix passed in
+            valid_radius=float('inf'),         # the valid radius each node considers for message passing
+            m_pool_method='sum',               # whether to mean or sum pool for output node representation
+            soft_edges=False,                  # extra GLU on the edges, purportedly helps stabilize the network in updated version of the paper
+            coor_weights_clamp_value=None      # clamping of the coordinate updates, again, for stabilization purposes
         )
 
+        self.egnn_2 = EGNN(
+            dim=self.embedding_dim,
+            edge_dim=0,
+            m_dim=egnn_dim,
+            fourier_features=0,
+            num_nearest_neighbors=egnn_max_nn,
+            dropout=dropout,
+            norm_feats=False,
+            norm_coors=True,
+            update_feats=True,
+            update_coors=False,
+            only_sparse_neighbors=False,
+            valid_radius=float('inf'),
+            m_pool_method='sum',
+            soft_edges=False,
+            coor_weights_clamp_value=None
+        )
+
+
         self.linear = nn.Sequential(
-            nn.Linear(embedding_dim+(rho_dimension if use_rho else 0)+(egnn_dim if use_egnn else 0), hidden_dim),
-            nn.SiLU(),
+            nn.Linear(self.embedding_dim, hidden_dim),
+            nn.ReLU(), # nn.SiLU(),
             nn.Dropout(p=dropout),
             nn.Linear(hidden_dim, hidden_dim//2),
-            nn.SiLU(),
+            nn.ReLU(), # nn.SiLU(),
             nn.Dropout(p=dropout),
             nn.Linear(hidden_dim//2, 1),
         )
@@ -274,9 +301,10 @@ class EpitopeModel(nn.Module) :
             embeddings = self.esm_embedder(X, repr_layers=[esm_model_layer_count], return_contacts=True)
 
         embeddings = embeddings["representations"][esm_model_layer_count].to(device)
-        egnn_embeddings, egnn_coords = self.egnn(X, coords, mask=mask)
         if self.use_rho : embeddings = torch.cat((embeddings, rho), 2)
-        if self.use_egnn : embeddings = torch.cat((embeddings, egnn_embeddings), 2)
+        if self.use_egnn :
+            embeddings, _ = self.egnn_1(embeddings, coords, mask=mask)
+            embeddings, _ = self.egnn_2(embeddings, coords, mask=mask)
         output = self.linear(embeddings)
 
         return output
@@ -364,10 +392,10 @@ for train_indices, dev_indices in kf.split(X_train) :
         embedding_dim=esm_embedding_dim,
         rho_dimension=ls,
         hidden_dim=512,
-        egnn_dim=128,
+        egnn_dim=512,
         egnn_depth=2,
-        egnn_max_nn=8,
-        dropout=0.25,
+        egnn_max_nn=10,
+        dropout=0.5,
         finetune_lm=False,
         use_rho=True,
         use_egnn=True,
