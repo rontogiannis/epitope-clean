@@ -10,6 +10,7 @@ import random
 import copy
 import esm
 import csv
+import biotite.structure.io as bsio
 
 from typing import Tuple
 from torch import nn, Tensor
@@ -23,6 +24,8 @@ from sklearn.model_selection import KFold
 from Bio.PDB.PDBParser import PDBParser
 from sklearn.neighbors import NearestNeighbors
 from egnn_pytorch import EGNN_Network, EGNN
+from x_transformers import ContinuousTransformerWrapper, Encoder, Decoder, XTransformer
+from se3_transformer_pytorch import SE3Transformer
 
 d3to1 = {
     "CYS": "C",
@@ -60,26 +63,27 @@ print(f"Running on device: {device}")
 
 train_path = "/data/scratch/aronto/epitope_clean/data/BP3C50ID/train.fasta"
 train_pdbs = "/data/scratch/aronto/epitope_clean/data/BP3C50ID/train-pred/"
-test_path = "/data/scratch/aronto/epitope_clean/data/BP3C50ID/test.fasta"
+test_path = "/data/scratch/aronto/epitope_clean/data/IEDB/IEDB_reduced_test.fasta" # "/data/scratch/aronto/epitope_clean/data/BP3C50ID/test.fasta"
 test_pdbs = "/data/scratch/aronto/epitope_clean/data/BP3C50ID/test-pred/"
 
 ESM_MODELS = [
     ("esm2_t30_150M_UR50D", 30, 640),
     ("esm1b_t33_650M_UR50S", 33, 1280),
     ("esm2_t33_650M_UR50D", 33, 1280),
+    ("esm2_t6_8M_UR50D", 6, 320),
 ]
 
 esm_model_name, esm_model_layer_count, esm_embedding_dim = ESM_MODELS[0]
 
-batch_size = 16
-epochs = 20
+batch_size = 1
+epochs = 30
 
-kappa = 16
+kappa = 8
 lambdas = [1., 2., 5., 10., 30.]
 ls = len(lambdas)
 
 # max padded length of sequence
-max_padded_length = 950 # 933 actual maximum length on training/test data
+max_padded_length = 34355 # 950 # 933 actual maximum length on training/test data, 343550 when testing on IEDB
 
 # load esm2
 try :
@@ -143,7 +147,7 @@ def m_diff(m, xi, xj) :
     return [m*a, m*b, m*c]
 
 # loads dataset and returns X, y to be fed to the DataLoader
-def process_data_file(path, pdbs) :
+def process_data_file(path, pdbs, take_all=False, struct_feats=False) :
     print(f"Processing dataset {path}")
 
     with open(path, "r") as f :
@@ -153,8 +157,8 @@ def process_data_file(path, pdbs) :
 
     sequences = [lines[i].upper() for i in range(1, len(lines), 2)]
     masks = [[0]+[1]*len(seq)+(max_padded_length-len(seq)+1)*[0] for seq in sequences]
-    pdb_ids = [lines[i][1:].split("_")[0] for i in range(0, len(lines), 2)]
-    chain_ids = [lines[i][1:].split("_")[1] for i in range(0, len(lines), 2)]
+    pdb_ids = [lines[i][1:].split("_")[0] if "_" in lines[i][1:] else lines[i][1:] for i in range(0, len(lines), 2)]
+    chain_ids = [lines[i][1:].split("_")[1] if "_" in lines[i][1:] else "NA" for i in range(0, len(lines), 2)]
     epitope_residues = [[0]+[1 if c.isupper() else 0 for c in lines[i]]+(max_padded_length-len(lines[i])+1)*[0] for i in range(1, len(lines), 2)]
 
     # tokenize
@@ -163,57 +167,68 @@ def process_data_file(path, pdbs) :
     _, _, batch_tokens = batch_converter(seq_with_id)
     batch_tokens = batch_tokens[:-1] # X
 
-    # get 3D structures
-    coordinates = []
-    rhos = []
+    if struct_feats :
+        # get 3D structures
+        coordinates = []
+        rhos = []
+        indx = 0
+        indices = []
 
-    print("Calculating 3D features")
-    for pdb_id, chain_id, seq in tqdm(zip(pdb_ids, chain_ids, sequences)) :
-        parser = PDBParser(QUIET=True)
-        model = parser.get_structure(pdb_id, f"{pdbs}{pdb_id}_{chain_id}.pdb")[0]
-        coord = []
+        print("Calculating 3D features")
+        for pdb_id, chain_id, seq in tqdm(zip(pdb_ids, chain_ids, sequences)) :
+            struct = bsio.load_structure(f"{pdbs}{pdb_id}_{chain_id}.pdb", extra_fields=["b_factor"])
+            if struct.b_factor.mean() >= 80.0 or take_all :
+                indices.append(indx)
+            indx += 1
 
-        for residue in model["A"] :
-            for atom in residue :
-                if atom.get_name() == "CA" :
-                    coord.append(atom.get_coord().tolist())
+            parser = PDBParser(QUIET=True)
+            model = parser.get_structure(pdb_id, f"{pdbs}{pdb_id}_{chain_id}.pdb")[0]
+            coord = []
 
-        # residue depth approximation
-        n = len(coord)
-        _, NN = NearestNeighbors(n_neighbors=kappa, algorithm="ball_tree").fit(coord).kneighbors(coord)
-        pairwise = [[[math.exp(-sq_norm(coord[i], coord[NN[i][j]])/lam)
-                        for j in range(kappa)]
+            for residue in model["A"] :
+                for atom in residue :
+                    if atom.get_name() == "CA" :
+                        coord.append(atom.get_coord().tolist())
+
+            # residue depth approximation
+            n = len(coord)
+            _, NN = NearestNeighbors(n_neighbors=kappa, algorithm="ball_tree").fit(coord).kneighbors(coord)
+            pairwise = [[[math.exp(-sq_norm(coord[i], coord[NN[i][j]])/lam)
+                            for j in range(kappa)]
+                            for i in range(n)]
+                            for lam in lambdas]
+            sums = [[sum(pairwise[l][i])
                         for i in range(n)]
-                        for lam in lambdas]
-        sums = [[sum(pairwise[l][i])
+                        for l in range(ls)]
+            w = [[[pairwise[l][i][j]/sums[l][i]
+                    for j in range(kappa)]
                     for i in range(n)]
                     for l in range(ls)]
-        w = [[[pairwise[l][i][j]/sums[l][i]
-                for j in range(kappa)]
-                for i in range(n)]
-                for l in range(ls)]
-        numer = [[norm(sum_vecs([m_diff(w[l][i][j], coord[i], coord[NN[i][j]])
-                    for j in range(kappa)]))
-                    for i in range(n)]
+            numer = [[norm(sum_vecs([m_diff(w[l][i][j], coord[i], coord[NN[i][j]])
+                        for j in range(kappa)]))
+                        for i in range(n)]
+                        for l in range(ls)]
+            denom = [[sum([w[l][i][j]*norm(m_diff(1, coord[i], coord[NN[i][j]]))
+                        for j in range(kappa)])
+                        for i in range(n)]
+                        for l in range(ls)]
+            rho = [[numer[l][i]/denom[l][i]
                     for l in range(ls)]
-        denom = [[sum([w[l][i][j]*norm(m_diff(1, coord[i], coord[NN[i][j]]))
-                    for j in range(kappa)])
                     for i in range(n)]
-                    for l in range(ls)]
-        rho = [[numer[l][i]/denom[l][i]
-                for l in range(ls)]
-                for i in range(n)]
 
-        coord_padded = [[.0, .0, .0]]+coord+(max_padded_length-len(seq)+1)*[[.0, .0, .0]]
-        rho_padded = [[.0]*ls]+rho+(max_padded_length-len(seq)+1)*[[.0]*ls]
+            coord_padded = [[.0, .0, .0]]+coord+(max_padded_length-len(seq)+1)*[[.0, .0, .0]]
+            rho_padded = [[.0]*ls]+rho+(max_padded_length-len(seq)+1)*[[.0]*ls]
 
-        coordinates.append(coord_padded)
-        rhos.append(rho_padded)
+            coordinates.append(coord_padded)
+            rhos.append(rho_padded)
 
-    return np.array(batch_tokens.tolist()), np.array(masks), np.array(epitope_residues), np.array(coordinates), np.array(rhos)
+    if struct_feats :
+        return np.array(batch_tokens.tolist())[indices], np.array(masks)[indices], np.array(epitope_residues)[indices], np.array(coordinates)[indices], np.array(rhos)[indices]
+    else :
+        return np.array(batch_tokens.tolist()), np.array(masks), np.array(epitope_residues), np.zeros_like(masks), np.zeros_like(masks)
 
-X_train, mask_train, y_train, coord_train, rhos_train = process_data_file(train_path, train_pdbs)
-X_test, mask_test, y_test, coord_test, rhos_test = process_data_file(test_path, test_pdbs)
+X_train, mask_train, y_train, coord_train, rhos_train = process_data_file(train_path, train_pdbs, take_all=True, struct_feats=False)
+X_test, mask_test, y_test, coord_test, rhos_test = process_data_file(test_path, test_pdbs, take_all=True, struct_feats=False)
 
 test_dataset = EpitopeDataset(X_test, mask_test, y_test, coord_test, rhos_test)
 test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True)
@@ -232,60 +247,111 @@ class EpitopeModel(nn.Module) :
         finetune_lm: bool = False,
         use_rho: bool = False,
         use_egnn: bool = False,
+        use_transformer: bool = False,
+        use_se3_transformer: bool = False,
+        n_heads: int = 2,
+        transformer_dim: int = 512,
+        transformer_out_dim: int = 256,
+        transformer_depth: int = 2,
+        transformer_n_heads: int = 4,
+        se3_transformer_n_heads: int = 4,
+        se3_transformer_depth: int = 2,
+        se3_transformer_dim_head: int = 4,
+        se3_transformer_num_degrees: int = 4,
+        se3_transformer_valid_radius: int = 4
     ) :
         super().__init__()
 
         self.finetune_lm = finetune_lm
         self.use_rho = use_rho
         self.use_egnn = use_egnn
+        self.use_se3_transformer = use_se3_transformer
+        self.use_transformer = use_transformer
         self.embedding_dim = embedding_dim+(rho_dimension if use_rho else 0)
 
-        self.esm_embedder = esm_model # TODO: i dont like using global variables, pls change that
+        if finetune_lm :
+            self.esm_embedder = copy.deepcopy(esm_model) # TODO: i dont like using global variables, pls change that
+        else :
+            self.esm_embedder = esm_model
 
-        # TODO: this is ugly, figure out a way to have a list of EGNN's that works with DataParallel
-        self.egnn_1 = EGNN(
-            dim=self.embedding_dim,            # input dimension
-            edge_dim=0,                        # dimension of the edges, if exists, should be > 0
-            m_dim=egnn_dim,                    # hidden model dimension
-            fourier_features=0,                # number of fourier features for encoding of relative distance - defaults to none as in paper
-            num_nearest_neighbors=egnn_max_nn, # cap the number of neighbors doing message passing by relative distance
-            dropout=dropout,                   # dropout
-            norm_feats=False,                  # whether to layernorm the features
-            norm_coors=True,                   # whether to normalize the coordinates, using a strategy from the SE(3) Transformers paper
-            update_feats=True,                 # whether to update features - you can build a layer that only updates one or the other
-            update_coors=False,                # whether ot update coordinates
-            only_sparse_neighbors=False,       # using this would only allow message passing along adjacent neighbors, using the adjacency matrix passed in
-            valid_radius=float('inf'),         # the valid radius each node considers for message passing
-            m_pool_method='sum',               # whether to mean or sum pool for output node representation
-            soft_edges=False,                  # extra GLU on the edges, purportedly helps stabilize the network in updated version of the paper
-            coor_weights_clamp_value=None      # clamping of the coordinate updates, again, for stabilization purposes
-        )
+        #self.attn = nn.MultiheadAttention(
+        #    embed_dim=self.embedding_dim,
+        #    num_heads=n_heads,
+        #    batch_first=True,
+        #)
 
-        self.egnn_2 = EGNN(
-            dim=self.embedding_dim,
-            edge_dim=0,
-            m_dim=egnn_dim,
-            fourier_features=0,
-            num_nearest_neighbors=egnn_max_nn,
-            dropout=dropout,
-            norm_feats=False,
-            norm_coors=True,
-            update_feats=True,
-            update_coors=False,
-            only_sparse_neighbors=False,
-            valid_radius=float('inf'),
-            m_pool_method='sum',
-            soft_edges=False,
-            coor_weights_clamp_value=None
-        )
+        if use_se3_transformer :
+            # too much memory
+            self.se3_transformer = SE3Transformer(
+                dim = self.embedding_dim,
+                heads = se3_transformer_n_heads,
+                depth = se3_transformer_depth,
+                dim_head = se3_transformer_dim_head,
+                num_degrees = se3_transformer_num_degrees,
+                num_neighbors = 4,
+                valid_radius = se3_transformer_valid_radius
+            )
+
+        if use_transformer :
+            self.transformer = ContinuousTransformerWrapper(
+                dim_in = self.embedding_dim,
+                dim_out = transformer_out_dim,
+                max_seq_len = max_padded_length+2,
+                attn_layers = Decoder(
+                    dim = transformer_dim,
+                    depth = transformer_depth,
+                    heads = transformer_n_heads,
+                    rotary_pos_emb = True,
+                    attn_dropout = dropout,
+                    ff_dropout = dropout,
+                )
+            )
+
+        if use_egnn :
+            # TODO: this is ugly, figure out a way to have a list of EGNN's that works with DataParallel
+            self.egnn_1 = EGNN(
+                dim=self.embedding_dim,            # input dimension
+                edge_dim=0,                        # dimension of the edges, if exists, should be > 0
+                m_dim=egnn_dim,                    # hidden model dimension
+                fourier_features=0,                # number of fourier features for encoding of relative distance - defaults to none as in paper
+                num_nearest_neighbors=egnn_max_nn, # cap the number of neighbors doing message passing by relative distance
+                dropout=dropout,                   # dropout
+                norm_feats=False,                  # whether to layernorm the features
+                norm_coors=True,                   # whether to normalize the coordinates, using a strategy from the SE(3) Transformers paper
+                update_feats=True,                 # whether to update features - you can build a layer that only updates one or the other
+                update_coors=False,                # whether ot update coordinates
+                only_sparse_neighbors=False,       # using this would only allow message passing along adjacent neighbors, using the adjacency matrix passed in
+                valid_radius=float('inf'),         # the valid radius each node considers for message passing
+                m_pool_method='mean',              # whether to mean or sum pool for output node representation
+                soft_edges=False,                  # extra GLU on the edges, purportedly helps stabilize the network in updated version of the paper
+                coor_weights_clamp_value=None      # clamping of the coordinate updates, again, for stabilization purposes
+            )
+
+            self.egnn_2 = EGNN(
+                dim=self.embedding_dim,
+                edge_dim=0,
+                m_dim=egnn_dim,
+                fourier_features=0,
+                num_nearest_neighbors=egnn_max_nn,
+                dropout=dropout,
+                norm_feats=False,
+                norm_coors=True,
+                update_feats=True,
+                update_coors=False,
+                only_sparse_neighbors=False,
+                valid_radius=float('inf'),
+                m_pool_method='mean',
+                soft_edges=False,
+                coor_weights_clamp_value=None
+            )
 
 
         self.linear = nn.Sequential(
-            nn.Linear(self.embedding_dim, hidden_dim),
-            nn.ReLU(), # nn.SiLU(),
+            nn.Linear((transformer_out_dim if use_transformer else self.embedding_dim), hidden_dim),
+            nn.SiLU(),
             nn.Dropout(p=dropout),
             nn.Linear(hidden_dim, hidden_dim//2),
-            nn.ReLU(), # nn.SiLU(),
+            nn.SiLU(),
             nn.Dropout(p=dropout),
             nn.Linear(hidden_dim//2, 1),
         )
@@ -305,6 +371,10 @@ class EpitopeModel(nn.Module) :
         if self.use_egnn :
             embeddings, _ = self.egnn_1(embeddings, coords, mask=mask)
             embeddings, _ = self.egnn_2(embeddings, coords, mask=mask)
+        elif self.use_se3_transformer :
+            embeddings = self.se3_transformer(embeddings, coords, mask)
+        if self.use_transformer :
+            embeddings = self.transformer(embeddings, mask=mask)
         output = self.linear(embeddings)
 
         return output
@@ -391,14 +461,20 @@ for train_indices, dev_indices in kf.split(X_train) :
     model = nn.DataParallel(EpitopeModel(
         embedding_dim=esm_embedding_dim,
         rho_dimension=ls,
-        hidden_dim=512,
+        hidden_dim=256,
         egnn_dim=512,
         egnn_depth=2,
-        egnn_max_nn=10,
-        dropout=0.5,
+        egnn_max_nn=8,
+        dropout=0.2,
         finetune_lm=False,
-        use_rho=True,
-        use_egnn=True,
+        use_rho=False,
+        use_egnn=False,
+        use_se3_transformer=False,
+        use_transformer=False,
+        transformer_dim=512,
+        transformer_depth=2,
+        transformer_n_heads=4,
+        transformer_out_dim=256,
     )).to(device)
 
     criterion = nn.BCEWithLogitsLoss()
@@ -407,6 +483,8 @@ for train_indices, dev_indices in kf.split(X_train) :
     # training loop
     print(f"> Training model for split {split_count}.")
     split_count += 1
+
+    no_improvement = 0
 
     for epoch in range(1, epochs+1) :
         # train
@@ -422,6 +500,12 @@ for train_indices, dev_indices in kf.split(X_train) :
         if auc > best_auc :
             best_auc = auc
             best_model = copy.deepcopy(model)
+            no_improvement = 0
+        else :
+            no_improvement += 1
+            if no_improvement >= 10 :
+                print("Early Stopping.")
+                break
 
     # test
     print("> Running best model on test dataset.")
