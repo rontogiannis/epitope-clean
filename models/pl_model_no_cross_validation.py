@@ -110,7 +110,12 @@ class EpitopeLitModule(pl.LightningModule) :
         self.auc = AUROC()
 
     def on_validation_start(self) :
-        self.log("training/auc", self.auc.compute()) # validation starts, i.e. training epoch just finished (TODO: maybe add different AUROC object for train/validation, it shouldn't make a difference though)
+        try :
+            train_auc = self.auc.compute()
+        except Exception :
+            train_auc = 0.5
+
+        self.log("training/auc", train_auc) # validation starts, i.e. training epoch just finished (TODO: maybe add different AUROC object for train/validation, it shouldn't make a difference though)
         self.auc = AUROC()
 
     def on_test_start(self) :
