@@ -103,25 +103,39 @@ class EpitopeLitModule(pl.LightningModule) :
 
     def _shared_step(self, batch, batch_idx, update_auc=True, update_top_metric=True) :
         X, mask, y, iedb_emb = batch
+
         out = self.model(X, iedb_emb).squeeze(-1)
-        top_idx = torch.argmax(out, dim=-1)
-        top_k_idx = torch.topk(out, self.k, dim=-1).indices
-        top_y = torch.gather(y, -1, top_idx.unsqueeze(-1)).squeeze(-1)
-        top_y_k = torch.max(torch.gather(y, -1, top_k_idx), dim=-1).values
+
+        # loss
+        out_top_k_obj = torch.topk(out, self.k, dim=-1)
+        y_top_k = torch.gather(y, -1, out_top_k_obj.indices)
+        loss = self.criterion(out_top_k_obj.values, y_top_k.float())
+
+        # other metrics
+        out_top_idx = out_top_k_obj.indices[:,:1]
+        y_top_k_pooled = torch.max(y_top_k, dim=-1).values
+        y_top = torch.gather(y, -1, out_top_idx) #.squeeze(-1)
+
+        #maxo = torch.max(out, dim=-1)
+        #top_idx = maxo.indices # torch.argmax(out, dim=-1)
+        #top_out = maxo.values
+        #top_k_idx = torch.topk(out, self.k, dim=-1).indices
+        #top_y = torch.gather(y, -1, top_idx.unsqueeze(-1)).squeeze(-1)
+        #top_y_k = torch.max(torch.gather(y, -1, top_k_idx), dim=-1).values
         mask = mask.flatten()
         out = out.flatten()
         out = torch.masked_select(out, mask)
         y = y.flatten()
         y = torch.masked_select(y, mask)
-        loss = self.criterion(out, y.float())
+        #loss = self.criterion(top_out, top_y.float()) # (out, y.float())
 
         if update_auc :
             self.auc.update(out, y)
 
         if update_top_metric :
-            self.yes += torch.sum(top_y)
-            self.yes_k += torch.sum(top_y_k)
-            self.all += top_y.shape[0]
+            self.yes += torch.sum(y_top)
+            self.yes_k += torch.sum(y_top_k_pooled)
+            self.all += y_top.shape[0]
 
         return loss
 
@@ -193,8 +207,8 @@ EPOCHS = 50
 CHECKPOINTS = "/data/scratch/aronto/epitope_clean/models/checkpoints/"
 
 def train(model, include_iedb) :
-    auc_callback = ModelCheckpoint(
-        monitor="validation/auc",
+    metric_callback = ModelCheckpoint(
+        monitor="validation/top_acc",
         dirpath=CHECKPOINTS,
         filename="best",
         auto_insert_metric_name=False,
@@ -204,7 +218,7 @@ def train(model, include_iedb) :
     ModelSummary(model)
 
     raw_train = process_data_file(TRAIN, model.model.esm_model.alphabet, MAX_PAD, is_iedb=0)
-    raw_iedb = process_data_file(IEDB, model.model.esm_model.alphabet, MAX_PAD, is_iedb=1)
+    raw_iedb = process_data_file(IEDB, model.model.esm_model.alphabet, MAX_PAD, is_iedb=0)
     raw_concat = list(map(add, raw_train, raw_iedb)) if include_iedb else raw_train
 
     train_dataset = EpitopeDataset(*raw_concat)
@@ -221,7 +235,7 @@ def train(model, include_iedb) :
 
     trainer = pl.Trainer(
         logger=wandb_logger,
-        callbacks=[auc_callback],
+        callbacks=[metric_callback],
         accelerator="gpu",
         devices=-1,
         strategy="ddp",
@@ -231,7 +245,7 @@ def train(model, include_iedb) :
 
     trainer.fit(model, train_loader, dev_loader)
 
-    return auc_callback.best_model_path
+    return metric_callback.best_model_path
 
 def setup_cmd() :
     parser = argparse.ArgumentParser()
@@ -268,6 +282,7 @@ if __name__ == "__main__" :
         model = EpitopeLitModule(
             criterion=nn.BCEWithLogitsLoss(),
             lr=0.001,
+            k=10,
             esm_model_name="esm2_t30_150M_UR50D",
             esm_layer_cnt=30,
             esm_dim=640,
