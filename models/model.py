@@ -26,6 +26,11 @@ from operator import add
 from sklearn.neighbors import NearestNeighbors, KDTree
 from tqdm.auto import tqdm
 
+from Bio.PDB import PDBParser
+from Bio.PDB.DSSP import DSSP
+
+from pylcs import lcs_sequence_idx
+
 TRAIN = "/data/scratch/aronto/epitope_clean/data/GraphBepi/train.fasta"
 IEDB = "/data/scratch/aronto/epitope_clean/data/IEDB/IEDB_reduced.fasta"
 TEST = "/data/scratch/aronto/epitope_clean/data/GraphBepi/test.fasta"
@@ -55,14 +60,16 @@ amino2int = {
 }
 
 class EpitopeDataset(Dataset) :
-    def __init__(self, X, mask, y, coord, rho, adj, feat, iedb_emb, max_pad, d_seq) :
+    def __init__(self, X, lengths, mask, y, coord, rho, adj, feat, dssp_feats, iedb_emb, max_pad, d_seq) :
         self.X = torch.tensor(X, dtype=torch.long)
+        self.lengths = torch.tensor(lengths, dtype=torch.long)
         self.mask = torch.tensor(mask, dtype=torch.long).bool()
         self.y = torch.tensor(y, dtype=torch.long)
         self.coord = torch.tensor(coord, dtype=torch.float)
         self.rho = torch.tensor(rho, dtype=torch.float)
         self.adj = adj
         self.feat = feat
+        self.dssp_feats = torch.tensor(dssp_feats, dtype=torch.float)
         self.iedb_emb = torch.tensor(iedb_emb, dtype=torch.float)
         self.adj_dim = (max_pad+2, max_pad+2)
         self.feat_dim = (max_pad+2, max_pad+2, 21+21+2*d_seq+2)
@@ -77,7 +84,7 @@ class EpitopeDataset(Dataset) :
         adj_dense = torch.sparse.FloatTensor(adj_tensor, torch.ones(adj_tensor.shape[1]), self.adj_dim).to_dense().bool()
         feat_dense = torch.sparse.FloatTensor(feat_tensor, torch.ones(feat_tensor.shape[1]), self.feat_dim).to_dense()
 
-        return self.X[idx], self.mask[idx], self.y[idx], self.coord[idx], self.rho[idx], adj_dense, feat_dense, self.iedb_emb[idx]
+        return self.X[idx], self.lengths[idx], self.mask[idx], self.y[idx], self.coord[idx], self.rho[idx], adj_dense, feat_dense, self.dssp_feats[idx], self.iedb_emb[idx]
 
 class EGNNModule(nn.Module) :
     def __init__(
@@ -97,7 +104,7 @@ class EGNNModule(nn.Module) :
             m_dim=egnn_dim,
             fourier_features=0,
             num_nearest_neighbors=egnn_nn,
-            dropout=0, #dropout,
+            dropout=dropout,
             norm_feats=False,
             norm_coors=True,
             update_feats=True,
@@ -128,7 +135,12 @@ class EpitopePredictionModel(nn.Module) :
         egnn_layers: int,
         mlp_hidden_dim: int,
         dropout: float,
-        finetune_lm: bool = False
+        finetune_lm: bool = False,
+        use_rnn: bool = True,
+        total_padded_length: int = -1,
+        rnn_hidden_dim: int = 512,
+        rnn_num_layers: int = 2,
+        rnn_bidirectional: bool = True,
     ) :
         super().__init__()
 
@@ -146,15 +158,18 @@ class EpitopePredictionModel(nn.Module) :
         for param in self.esm_model.parameters() :
             param.requires_grad = finetune_lm
 
-        embedding_dim = esm_dim + 2 + (5 if use_rho else 0) # +2 for the IEDB embeddings +5 for rho
+        embedding_dim = esm_dim + 2 + (5 if use_rho else 0) + 11 # +2 for the IEDB embeddings +5 for rho # TODO make len(lambda) customizable +11 for the dssp features
+        d = 2 if rnn_bidirectional else 1
 
         # flags
+        self.finetune_lm = finetune_lm
         self.use_egnn = use_egnn
         self.use_rho = use_rho
+        self.use_rnn = use_rnn
 
         # Multi-layer perceptron
         self.mlp = nn.Sequential(
-            nn.Linear(embedding_dim, mlp_hidden_dim),
+            nn.Linear(embedding_dim if not use_rnn else d*rnn_hidden_dim, mlp_hidden_dim),
             nn.SiLU(),
             nn.Dropout(dropout),
             nn.Linear(mlp_hidden_dim, mlp_hidden_dim//2),
@@ -167,7 +182,7 @@ class EpitopePredictionModel(nn.Module) :
         self.egnn = nn.Sequential(
             *[EGNNModule(
                 embedding_dim=embedding_dim,
-                dropout=dropout,
+                dropout=0,
                 egnn_dim=egnn_dim,
                 egnn_nn=egnn_nn,
                 egnn_edge_dim=egnn_edge_dim,
@@ -175,13 +190,34 @@ class EpitopePredictionModel(nn.Module) :
             ) for layer in range(egnn_layers)]
         )
 
-    def forward(self, X, mask, coors, rho, adj, feat, iedb_emb) :
-        with torch.no_grad() :
+        # RNN of choice
+        self.rnn = nn.GRU(
+            input_size=embedding_dim,
+            hidden_size=rnn_hidden_dim,
+            num_layers=rnn_num_layers,
+            batch_first=True,
+            bias=True,
+            dropout=dropout,
+            bidirectional=True,
+        )
+
+        self.total_padded_length = total_padded_length
+
+    def forward(self, X, lens, mask, coors, rho, adj, feat, dssp_feat, iedb_emb) :
+        if not self.finetune_lm : # TODO is there a cleaner way to do this?
+            with torch.no_grad() :
+                dct = self.esm_model(X, repr_layers=[self.ll_idx], return_contacts=False)
+                emb = dct["representations"][self.ll_idx]
+        else :
             dct = self.esm_model(X, repr_layers=[self.ll_idx], return_contacts=False)
             emb = dct["representations"][self.ll_idx]
+        emb = torch.cat((emb, dssp_feat), 2)
         emb = torch.cat((emb, iedb_emb), 2)
         emb = torch.cat((emb, rho), 2) if self.use_rho else emb
         emb = self.egnn((emb, coors, adj, feat, mask))[0] if self.use_egnn else emb
+        emb = torch.nn.utils.rnn.pack_padded_sequence(emb, lens.cpu(), batch_first=True, enforce_sorted=False) if self.use_rnn else emb
+        emb, hn = (self.rnn(emb) if self.use_rnn else (emb, None))
+        emb, _ = (torch.nn.utils.rnn.pad_packed_sequence(emb, batch_first=True, total_length=self.total_padded_length) if self.use_rnn else (emb, None))
         out = self.mlp(emb)
         return out
 
@@ -218,8 +254,8 @@ class EpitopeLitModule(pl.LightningModule) :
         return torch.optim.Adam(grouped_parameters, lr=self.hparams.lr)
 
     def _shared_step(self, batch, batch_idx, update_auc=True, update_top_metric=True) :
-        X, mask, y, coors, rho, adj, feat, iedb_emb = batch
-        out = self.model(X, mask, coors, rho, adj, feat, iedb_emb).squeeze(-1)
+        X, lens, mask, y, coors, rho, adj, feat, dssp_feat, iedb_emb = batch
+        out = self.model(X, lens, mask, coors, rho, adj, feat, dssp_feat, iedb_emb).squeeze(-1)
 
         # evaluation metrics
         top_idx = torch.argmax(out, dim=-1)
@@ -290,6 +326,8 @@ def tokenize(tokenizer, seqs, ids, max_pad) :
 COORDS = "/data/scratch/aronto/epitope_clean/data/GraphBepi/coords.json"
 RHO = "/data/scratch/aronto/epitope_clean/data/GraphBepi/Rhos/rho_{}.json"
 GRAPH = "/data/scratch/aronto/epitope_clean/data/GraphBepi/Graphs/graph_{}.xz"
+PDB = "/data/scratch/aronto/epitope_clean/data/GraphBepi/pdb/{}.pdb"
+DSSP_DIR = "/data/scratch/aronto/epitope_clean/data/GraphBepi/DSSP/dssp_{}.xz"
 
 # utility functions for calculating the approximation of residue depth
 def sq_norm(xi, xj) :
@@ -436,6 +474,68 @@ def build_graph(pdb_id, seq, coord, d_seq=2, k=10, radius=10.) :
 
     return [adj, feat]
 
+ss_map = {
+    "H": 0,
+    "B": 1,
+    "E": 2,
+    "G": 3,
+    "I": 4,
+    "T": 5,
+    "S": 6,
+    "-": 7,
+}
+
+def get_dssp_feats(pdb_id, known_seq) :
+    if os.path.isfile(DSSP_DIR.format(pdb_id)) :
+        with lzma.open(DSSP_DIR.format(pdb_id), "rb") as f :
+            dssp = pickle.load(f)
+            f.close()
+        return dssp
+
+    p = PDBParser()
+    structure = p.get_structure(pdb_id, PDB.format(pdb_id))
+
+    model = structure[0]
+    dssp = DSSP(model, PDB.format(pdb_id), dssp="mkdssp")
+    out = []
+    out_aligned = []
+    seq_dssp = ""
+
+    # e.g. result of dssp:
+    # (829, 'E', '-', 0.29381443298969073, -114.1, 360.0, -2, -0.9, -219, -0.3, -11, -0.2, -221, -0.1)
+
+    for residue in dssp :
+        seq_dssp = seq_dssp + residue[1]
+        ss_emb = [0]*8
+        ss_emb[ss_map[residue[2]]] = 1 # secondary structure
+        out.append(ss_emb+[residue[3]*100, residue[4], residue[5]]) # relative ASA, phi, psi
+
+    # align the sequence obtained by dssp with the known sequence, padding as needed
+    idx = lcs_sequence_idx(known_seq, seq_dssp)
+
+    for i in idx :
+        if i == -1 :
+            out_aligned.append([0]*11)
+        else :
+            out_aligned.append(out[i])
+
+    assert len(out_aligned) == len(known_seq), f"{pdb_id}, {len(out)=} != {len(known_seq)=}"
+
+    with lzma.open(DSSP_DIR.format(pdb_id), "wb") as f :
+        pickle.dump(out_aligned, f)
+        f.close()
+
+    return out_aligned
+
+def pick_correct_file(pdb_id) :
+    struct_id, chain_id = pdb_id.split("_")
+    is_lower = os.path.isfile(PDB.format(struct_id+"_"+chain_id.lower()))
+    is_upper = os.path.isfile(PDB.format(struct_id+"_"+chain_id.upper()))
+    if (is_lower and is_upper) or not (is_lower or is_upper) :
+        assert 0
+    chain_id = chain_id.lower() if is_lower else chain_id.upper()
+    return struct_id + "_" + chain_id
+
 def process_data_file(path, tokenizer, max_pad, split, is_iedb=0, d_seq=2, k=10, radius=10.) :
     with open(path, "r") as f :
         lines = [l.strip() for l in f.readlines()]
@@ -446,10 +546,13 @@ def process_data_file(path, tokenizer, max_pad, split, is_iedb=0, d_seq=2, k=10,
         f.close()
 
     seqs = [l.upper() for l in lines[1::2]]
-    ids = [l[1:] for l in lines[::2]]
+    ids = [pick_correct_file(l[1:]) for l in lines[::2]]
 
     # amino-acid tokens
     seqs_tok = tokenize(tokenizer, seqs, ids, max_pad).tolist()
+
+    # lengths
+    lengths = [len(seq)+1 for seq in seqs]
 
     # masks
     masks = [pad([1]*len(seq), max_pad) for seq in seqs]
@@ -458,30 +561,33 @@ def process_data_file(path, tokenizer, max_pad, split, is_iedb=0, d_seq=2, k=10,
     ep_resi = [[int(c.isupper()) for c in l] for l in lines[1::2]]
     ep_resi_pad = [pad(epr, max_pad) for epr in ep_resi]
 
+    # DSSP features
+    dssp_feats = [pad(get_dssp_feats(pdb_id, seq), max_pad, empty=[0]*11) for pdb_id, seq in zip(ids, seqs)]
+
     # IEDB flag-embeddings
     iedb_emb_single = [0, 0]
     iedb_emb_single[is_iedb] = 1
     iedb_emb = [pad([iedb_emb_single for i in range(len(seq))], max_pad, empty=[0,0]) for seq in seqs]
 
     # coordinate embeddings
-    coors_unpad = [coor_dict[l[1:]] for l in lines[::2]]
+    coors_unpad = [coor_dict[pdb_id] for pdb_id in ids]
     coors = [pad(coor, max_pad, empty=[0,0,0]) for coor in coors_unpad]
 
     # build graph to be used by egnn, if not already built
-    graphs = [build_graph(pdb_id[1:], seq, coord, d_seq, k, radius) for pdb_id, seq, coord in zip(lines[::2], seqs, coors_unpad)]
+    graphs = [build_graph(pdb_id, seq, coord, d_seq, k, radius) for pdb_id, seq, coord in zip(ids, seqs, coors_unpad)]
     adj = [graph[0] for graph in graphs]
     feat = [graph[1] for graph in graphs]
 
     # surface features (residue depth) # TODO optimize
-    rho_unpad = [residue_depth(coord, pdb_id[1:], [1., 2., 5., 10., 30.]) for coord, pdb_id in zip(coors_unpad, lines[::2])]
+    rho_unpad = [residue_depth(coord, pdb_id, [1., 2., 5., 10., 30.]) for coord, pdb_id in zip(coors_unpad, ids)]
     rho = [pad(rd, max_pad, empty=[0,0,0,0,0]) for rd in rho_unpad]
 
-    return [seqs_tok, masks, ep_resi_pad, coors, rho, adj, feat, iedb_emb, max_pad, d_seq]
+    return [seqs_tok, lengths, masks, ep_resi_pad, coors, rho, adj, feat, dssp_feats, iedb_emb, max_pad, d_seq]
 
 MAX_PAD = 950
-BATCH_SIZE = 2
+BATCH_SIZE = 4
 NUM_WORKERS = 8
-EPOCHS = 50
+EPOCHS = 150
 CHECKPOINTS = "/data/scratch/aronto/epitope_clean/models/checkpoints/"
 
 def train(model, include_iedb, d_seq=2, k=10, radius=10.) :
@@ -534,6 +640,7 @@ def setup_cmd() :
     parser.add_argument("--rho", help="include residue depth as part of the embeddings", action="store_true")
     parser.add_argument("--iedb", help="include IEDB data in training", action="store_true")
     parser.add_argument("--seed", help="set the seed (default 13)", type=int, default=137)
+    parser.add_argument("--load", help="choose a pre-trained model to load (only for training, TODO: add for testing as well)", type=str, default="") # TODO: add for testing
 
     args = vars(parser.parse_args())
 
@@ -561,7 +668,7 @@ if __name__ == "__main__" :
 
     args = setup_cmd()
 
-    pl.seed_everything(args["seed"])
+    pl.seed_everything(args["seed"], workers=True)
 
     esm_models = {
         "3B": {"name": "esm2_t36_3B_UR50D", "layer_cnt": 36, "dim": 2560},
@@ -570,23 +677,35 @@ if __name__ == "__main__" :
         "8M": {"name": "esm2_t6_8M_UR50D", "layer_cnt": 6, "dim": 320},
     }
 
+    esm_model_name = "150M"
+
     if args["train"] :
-        model = EpitopeLitModule(
-            criterion=nn.BCEWithLogitsLoss(),
-            lr=0.0001,
-            esm_model_name=esm_models["35M"]["name"],
-            esm_layer_cnt=esm_models["35M"]["layer_cnt"],
-            esm_dim=esm_models["35M"]["dim"],
-            use_egnn=args["egnn"],
-            use_rho=args["rho"],
-            egnn_dim=256,
-            egnn_edge_dim=21+21+2*d_seq+2,
-            egnn_nn=10,
-            egnn_layers=2,
-            mlp_hidden_dim=256,
-            dropout=0.1,
-            finetune_lm=True,
-        )
+        if args["load"] == "" :
+            model = EpitopeLitModule(
+                criterion=nn.BCEWithLogitsLoss(),
+                lr=5e-5, # TODO: should this be lower?
+                esm_model_name=esm_models[esm_model_name]["name"],
+                esm_layer_cnt=esm_models[esm_model_name]["layer_cnt"],
+                esm_dim=esm_models[esm_model_name]["dim"],
+                use_egnn=args["egnn"],
+                use_rho=args["rho"],
+                egnn_dim=256,
+                egnn_edge_dim=21+21+2*d_seq+2,
+                egnn_nn=10,
+                egnn_layers=2,
+                mlp_hidden_dim=128,
+                dropout=0.1,
+                finetune_lm=False,
+                use_rnn=True,
+                rnn_hidden_dim=128,
+                rnn_num_layers=3,
+                rnn_bidirectional=True,
+                total_padded_length=MAX_PAD+2,
+            )
+        else :
+            print("Loading pretrained model from {}".format(args["load"]))
+            model = EpitopeLitModule.load_from_checkpoint(args["load"], map_location="cpu")
+            model.hparams.lr = 5e-5
 
         checkpoint_path = train(model, args["iedb"], d_seq, k, radius)
         print(f"Best checkpoint saved at {checkpoint_path}")
