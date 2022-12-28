@@ -587,7 +587,7 @@ def process_data_file(path, tokenizer, max_pad, split, is_iedb=0, d_seq=2, k=10,
 MAX_PAD = 950
 BATCH_SIZE = 4
 NUM_WORKERS = 8
-EPOCHS = 150
+EPOCHS = 60
 CHECKPOINTS = "/data/scratch/aronto/epitope_clean/models/checkpoints/"
 
 def train(model, include_iedb, d_seq=2, k=10, radius=10.) :
